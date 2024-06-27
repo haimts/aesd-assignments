@@ -1,10 +1,17 @@
 CROSS_CC=$(CROSS_COMPILE)
 CC=$(CROSS_CC)gcc
 CFLAGS=-g -Wall
-all: aesdsocket aesdsocket.o aesdsocket.c
-aeldsocket: aesdsocket.o
-	$(CC) $< -o $@
-aeldsocket.o: aesdsocket.c
+OBJECTS=aesdsocket.o aesdsocketpthreadutils.o aesdsocketpthreadclient.o
+HEADERS=aesdsocketTypes.h
+LIBS=-lpthread
+all: aesdsocket aesdsocket.o aesdsocket.c aesdsocketpthreadclient.c aesdsocketpthreadutils.c aesdsocketTypes.h
+aesdsocket: $(OBJECTS)
+	$(CC) $(OBJECTS) $(LIBS) -o $@ 
+aesdsocketpthreadutils.o: aesdsocketpthreadutils.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $< -o $@
+aesdsocketpthreadclient.o: aesdsocketpthreadclient.c $(HEADERS)
+	$(CC) $(CFLAGS) -c $< -o $@
+aesdsocket.o: aesdsocket.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 clean:
-	rm -f aesdsocket.o aesdsocket
+	rm -f aesdsocketpthreadclient.o aesdsocketpthreadutils.o aesdsocket.o aesdsocket

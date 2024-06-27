@@ -1,436 +1,247 @@
 /*
-** pollserver.c -- a cheezy multiperson chat server
+** server.c -- a stream socket server demo
 */
+#define _GNU_SOURCE
 #include <stdio.h>
-#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <syslog.h>
+#include <pthread.h>
+#include <signal.h>
+#include <netdb.h>
+#include <errno.h>
+#include <sys/queue.h>
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <netdb.h>
-#include <poll.h>
 #include <sys/stat.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <signal.h>
-#include <getopt.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include "aesdsocketTypes.h"
 
-#define PORT "9000"		// Port we're listening on
+
+#define D_PORT "9000"
+
+//#define D_BUFFER_SIZE 4096
 
 #define TEMP_OUTPUT_PATH "/var/tmp/aesdsocketdata"
 
-typedef struct AESD_SERVER_ARGUMENT_TAG
-{
-  bool deamon_mode;
-} AESD_SERVER_ARGUMENT;
+extern void* handle_client(void* client_socket);
+extern void* thread_timer(void* client_socket);
+extern void setup_signal_handling();
+extern void cleanupExitThreads(server_state_t *server_state);
+extern void terminateAllThreadByForce(server_state_t *server_state);
 
-static AESD_SERVER_ARGUMENT server_argument;
-
-void
-sigint_handler (int signum, siginfo_t * info, void *extra)
-{
-  // waitpid() might overwrite errno, so we save and restore it:
-  int saved_errno = errno;
-
-  printf ("Catch sig handler %d\n", signum);
-
-  errno = saved_errno;
-}
+//*****************************
+// Global server state instance
+//*****************************
+server_state_t server_state;
 
 // Get sockaddr, IPv4 or IPv6:
-void *
-get_in_addr (struct sockaddr *sa)
-{
-  if (sa->sa_family == AF_INET)
-    {
-      return &(((struct sockaddr_in *) sa)->sin_addr);
+extern void*
+get_in_addr(struct sockaddr *sa);
+
+extern int parse(int argc, char **argv);
+
+int setup_server() {
+    struct addrinfo hints, *res, *p;
+    int yes = 1;
+    int rv;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_UNSPEC; // Either IPv4 or IPv6
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE; // Use my IP
+
+    if ((rv = getaddrinfo(NULL, D_PORT, &hints, &res)) != 0) {
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        exit(EXIT_FAILURE);
     }
 
-  return &(((struct sockaddr_in6 *) sa)->sin6_addr);
+    // Loop through all the results and bind to the first we can
+    for (p = res; p != NULL; p = p->ai_next) {
+        if ((server_state.server_fd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+            perror("socket");
+            continue;
+        }
+
+        if (setsockopt(server_state.server_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+            perror("setsockopt");
+            close(server_state.server_fd);
+            continue;
+        }
+
+        if (bind(server_state.server_fd, p->ai_addr, p->ai_addrlen) == -1) {
+            perror("bind");
+            close(server_state.server_fd);
+            continue;
+        }
+
+        break;
+    }
+
+    if (p == NULL) {
+        fprintf(stderr, "Failed to bind\n");
+        exit(EXIT_FAILURE);
+    }
+
+    freeaddrinfo(res);
+
+    if (listen(server_state.server_fd, 10) == -1) {
+        perror("listen");
+        exit(EXIT_FAILURE);
+    }
+
+    openlog(NULL, LOG_PID, LOG_USER);
+
+
+    server_state.logger_fd = open(TEMP_OUTPUT_PATH, O_RDWR | O_TRUNC | O_CLOEXEC | O_CREAT | O_DSYNC,
+    S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (server_state.logger_fd == -1)
+    {
+        close(server_state.server_fd);
+        fprintf(stderr, "%s on %s\n", strerror(errno), TEMP_OUTPUT_PATH);
+        pthread_exit((void*)1);
+    }
+
+    if (server_state.deamon_mode)
+    {
+        pid_t pid;
+        pid = fork();
+        if (pid < 0)
+        {
+            close(server_state.server_fd);
+            fprintf(stderr, "error while trying to enter deamon mode\n");
+            exit(-1);
+        }
+        if (pid > 0)
+        {
+            close(server_state.server_fd);
+            syslog(LOG_DEBUG, "starting deamon at PID=%d\n", pid);
+            printf("starting deamon at PID=%d\n", pid);
+            exit(0);
+        }
+
+        if (setsid() < 0)
+        {
+            // FAIL
+            close(server_state.server_fd);
+            fprintf(stderr, "error while trying to set session id\n");
+            exit(-1);
+        }
+        //Child process in deamon mode redirect all std io to null
+        close(0);       //stdin
+        close(1);       //stdout
+        close(2);       //stderr
+        open("/dev/null", O_RDWR);
+        dup(0);         //stdout
+        dup(0);         //stderr
+        // Create a SID for child
+    }
+    return server_state.server_fd;
 }
 
-// Return a listening socket
-int
-get_listener_socket (void)
-{
-  int listener;			// Listening socket descriptor
-  int yes = 1;			// For setsockopt() SO_REUSEADDR, below
-  int rv;
+int main(int argc, char** argv) {
+    int new_socket;
+    struct sockaddr_storage address;
+    socklen_t addrlen = sizeof(address);
+    char remoteIP[INET6_ADDRSTRLEN];
 
-  struct addrinfo hints, *ai, *p;
+    // Initialize server state
+    memset(&server_state, 0, sizeof(server_state_t));
+    server_state.stop_server = 0;
+    server_state.is_cleanup_needed = false;
 
-  // Get us a socket and bind it
-  memset (&hints, 0, sizeof hints);
-  hints.ai_family = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;
-  if ((rv = getaddrinfo (NULL, PORT, &hints, &ai)) != 0)
+    if (-1 == parse(argc, argv))
     {
-      fprintf (stderr, "selectserver: %s\n", gai_strerror (rv));
-      exit (1);
+        fprintf(stderr, "error getting command argument\n");
+        exit(-1);
     }
 
-  for (p = ai; p != NULL; p = p->ai_next)
-    {
-      listener = socket (p->ai_family, p->ai_socktype, p->ai_protocol);
-      if (listener < 0)
-	{
-	  continue;
-	}
+    setup_signal_handling();
+    server_state.server_fd = setup_server();
+    pthread_mutex_init(&server_state.mutex, NULL);
+    TAILQ_INIT(&server_state.head);
 
-      // Lose the pesky "address already in use" error message
-      setsockopt (listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof (int));
 
-      if (bind (listener, p->ai_addr, p->ai_addrlen) < 0)
-	{
-	  close (listener);
-	  continue;
-	}
-
-      break;
+    // Allocate memory for the new thread node
+    thread_node_t* new_node = malloc(sizeof(thread_node_t));
+    if (new_node == NULL) {
+        perror("malloc");
+        pthread_mutex_destroy(&server_state.mutex);
+        close(server_state.server_fd);
+        close(server_state.logger_fd);
+        exit(-1);
+    }
+    new_node->server = &server_state;
+    printf("handle_client: argument client_socket: %p\n",new_node);
+    if (pthread_create(&new_node->thread_id, NULL, thread_timer, new_node) != 0) {
+        perror("pthread_create");
+        free(new_node);
+    } else {
+        // Lock mutex before modifying shared list
+        pthread_mutex_lock(&server_state.mutex);
+        TAILQ_INSERT_TAIL(&server_state.head, new_node, entries);
+        // Unlock mutex after modifying shared list
+        pthread_mutex_unlock(&server_state.mutex);
     }
 
-  freeaddrinfo (ai);		// All done with this
+    printf("Server listening on port %s\n", D_PORT);
 
-  // If we got here, it means we didn't get bound
-  if (p == NULL)
-    {
-      return -1;
+    while (!server_state.stop_server) {
+        // clean up completed threads //TODO: [HZ: call bellow function cause massive possible memory loss]
+        cleanupExitThreads(&server_state);
+
+        // Accept a new connection
+        if ((new_socket = accept(server_state.server_fd, (struct sockaddr*)&address, &addrlen)) < 0) {
+            if (server_state.stop_server) break;
+            perror("accept");
+            continue;
+        }
+
+        printf("New connection accepted.\n");
+
+        syslog(LOG_DEBUG, "Accepted connection from %s",
+                inet_ntop(address.ss_family, get_in_addr((struct sockaddr*) &address), remoteIP,
+                INET6_ADDRSTRLEN));
+
+        // Allocate memory for the new thread node
+        thread_node_t* new_node = malloc(sizeof(thread_node_t));
+        if (new_node == NULL) {
+            perror("malloc");
+            close(new_socket);
+            continue;
+        }
+        new_node->socket_fd = new_socket;
+        new_node->server = &server_state;
+
+        if (pthread_create(&new_node->thread_id, NULL, handle_client, new_node) != 0) {
+            perror("pthread_create");
+            close(new_socket);
+            free(new_node);
+        } else {
+            // Lock mutex before modifying shared list
+            pthread_mutex_lock(&server_state.mutex);
+            TAILQ_INSERT_TAIL(&server_state.head, new_node, entries);
+            // Unlock mutex after modifying shared list
+            pthread_mutex_unlock(&server_state.mutex);
+        }
     }
+    syslog(LOG_DEBUG,"Server starting to clean up.\n");
+    // Close the server socket
+    close(server_state.server_fd);
 
-  // Listen
-  if (listen (listener, 10) == -1)
-    {
-      return -1;
-    }
+    syslog(LOG_DEBUG,"Server starting clean tailQ.\n");
+    // Join all threads
+    terminateAllThreadByForce(&server_state);
 
-  return listener;
-}
-
-// Add a new file descriptor to the set
-void
-add_to_pfds (struct pollfd *pfds[], int newfd, int *fd_count, int *fd_size)
-{
-  // If we don't have room, add more space in the pfds array
-  if (*fd_count == *fd_size)
-    {
-      *fd_size *= 2;		// Double it
-
-      *pfds = realloc (*pfds, sizeof (**pfds) * (*fd_size));
-    }
-
-  (*pfds)[*fd_count].fd = newfd;
-  (*pfds)[*fd_count].events = POLLIN;	// Check ready-to-read
-
-  (*fd_count)++;
-}
-
-// Remove an index from the set
-void
-del_from_pfds (struct pollfd pfds[], int i, int *fd_count)
-{
-  // Copy the one from the end over this one
-  pfds[i] = pfds[*fd_count - 1];
-
-  (*fd_count)--;
-}
-
-int
-parse (int argc, char **argv)
-{
-  int c;
-  int option_index = 0;
-  memset ((void *) &server_argument, 0, sizeof server_argument);
-  while (1)
-    {
-      static struct option long_option[] = {
-	{"demon", no_argument, 0, 0},
-	{0, 0, 0, 0}
-      };
-      c = getopt_long (argc, argv, "d", long_option, &option_index);
-      if (c == -1)
-	{
-	  break;
-	}
-
-      switch (c)
-	{
-	case 'd':
-	  server_argument.deamon_mode = true;
-	  break;
-	default:
-	  syslog (LOG_DEBUG, "Invalid argument\n");
-	  return -1;
-	  break;
-	}
-    }
-  return 0;
-}
-
-// Main
-int
-main (int argc, char *argv[])
-{
-  int listener;			// Listening socket descriptor
-
-  int newfd;			// Newly accept()ed socket descriptor
-  struct sockaddr_storage remoteaddr;	// Client address
-  socklen_t addrlen;
-
-  char buf[4096];		// Buffer for client data
-
-  char remoteIP[INET6_ADDRSTRLEN];
-
-  // Start off with room for 5 connections
-  // (We'll realloc as necessary)
-  int fd_count = 0;
-  int fd_size = 5;
-  int fd_log;
-  int count = 0;
-  unsigned int completePacket = 0;
-  struct sigaction sa;
-  struct pollfd *pfds = NULL;
-
-  if (-1 == parse (argc, argv))
-    {
-      fprintf (stderr, "error getting command argument\n");
-      exit (-1);
-    }
-
-  // Set up and get a listening socket
-  listener = get_listener_socket ();
-
-  if (listener == -1)
-    {
-      fprintf (stderr, "error getting listening socket\n");
-      exit (-1);
-    }
-
-  if (server_argument.deamon_mode)
-    {
-      pid_t pid;
-      pid = fork ();
-      if (pid < 0)
-	{
-	  close (listener);
-	  fprintf (stderr, "error while trying to enter deamon mode\n");
-	  exit (-1);
-	}
-      if (pid > 0)
-	{
-	  close (listener);
-	  syslog (LOG_DEBUG, "starting deamon at PID=%d\n", pid);
-	  printf ("starting deamon at PID=%d\n", pid);
-	  exit (0);
-	}
-
-      if (setsid () < 0)
-	{
-	  // FAIL
-	  close (listener);
-	  fprintf (stderr, "error while trying to set session id\n");
-	  exit (-1);
-	}
-      //Child process in deamon mode redirect all std io to null
-      close (0);		//stdin
-      close (1);		//stdout
-      close (2);		//stderr
-      open ("/dev/null", O_RDWR);
-      dup (0);			//stdout
-      dup (0);			//stderr
-      // Create a SID for child
-    }
-  pfds = (struct pollfd *) malloc (sizeof (struct pollfd) * fd_size);
-  if (NULL == pfds)
-    {
-      fprintf (stderr, "error allocation memory\n");
-      exit (-1);
-    }
-  memset ((void *) pfds, 0, sizeof *pfds * fd_size);
-
-  // Add the listener to set
-  pfds[0].fd = listener;
-  pfds[0].events = POLLIN;	// Report ready to read on incoming connection
-
-  fd_count = 1;			// For the listener
-
-  //sa.sa_handler = sigint_handler;
-  sigemptyset (&sa.sa_mask);
-  sa.sa_sigaction = sigint_handler;
-  sa.sa_flags = SA_RESTART | SA_SIGINFO;
-  if (sigaction (SIGINT, &sa, NULL) == -1)
-    {
-      free (pfds);
-      close (listener);
-      perror ("sigaction");
-      exit (1);
-    }
-
-  if (sigaction (SIGTERM, &sa, NULL) == -1)
-    {
-      free (pfds);
-      close (listener);
-      perror ("sigaction");
-      exit (1);
-    }
-
-  openlog (NULL, LOG_PID, LOG_USER);
-  fd_log =
-    open (TEMP_OUTPUT_PATH,
-	  O_RDWR | O_TRUNC | O_CLOEXEC | O_CREAT | O_DSYNC,
-	  S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
-  if (fd_log == -1)
-    {
-      free (pfds);
-      close (listener);
-      fprintf (stderr, "%s on %s\n", strerror (errno), TEMP_OUTPUT_PATH);
-      exit (1);
-    }
-  // Main loop
-  for (;;)
-    {
-      int poll_count = poll (pfds, fd_count, -1);
-
-      if (poll_count == -1)
-	{
-	  perror ("poll");
-	  break;
-	}
-
-      // Run through the existing connections looking for data to read
-      for (int i = 0; i < fd_count; i++)
-	{
-
-	  // Check if someone's ready to read
-	  if (pfds[i].revents & POLLIN)
-	    {			// We got one!!
-
-	      if (pfds[i].fd == listener)
-		{
-		  // If listener is ready to read, handle new connection
-
-		  addrlen = sizeof remoteaddr;
-		  newfd = accept (listener,
-				  (struct sockaddr *) &remoteaddr, &addrlen);
-
-		  if (newfd == -1)
-		    {
-		      perror ("accept");
-		    }
-		  else
-		    {
-		      add_to_pfds (&pfds, newfd, &fd_count, &fd_size);
-
-		      syslog (LOG_DEBUG, "Accepted connection from %s",
-			      inet_ntop (remoteaddr.ss_family,
-					 get_in_addr ((struct sockaddr *)
-						      &remoteaddr), remoteIP,
-					 INET6_ADDRSTRLEN));
-		      printf ("pollserver: new connection from %s on "
-			      "socket %d\n", inet_ntop (remoteaddr.ss_family,
-							get_in_addr ((struct
-								      sockaddr
-								      *)
-								     &remoteaddr),
-							remoteIP,
-							INET6_ADDRSTRLEN),
-			      newfd);
-		    }
-		}
-	      else
-		{
-                  memset(buf, 0, sizeof buf);
-		  // If not the listener, we're just a regular client
-		  int nbytes = recv (pfds[i].fd, buf, sizeof buf, 0);
-
-		  int sender_fd = pfds[i].fd;
-
-		  if (nbytes <= 0)
-		    {
-		      // Got error or connection closed by client
-		      if (nbytes == 0)
-			{
-			  // Connection closed
-			  syslog (LOG_DEBUG, "Closed connection from %s",
-				  inet_ntop (remoteaddr.ss_family,
-					     get_in_addr ((struct sockaddr *)
-							  &remoteaddr),
-					     remoteIP, INET6_ADDRSTRLEN));
-			  printf ("pollserver: socket %d hung up\n",
-				  sender_fd);
-			}
-		      else
-			{
-			  perror ("recv");
-			}
-
-		      close (pfds[i].fd);	// Bye!
-
-		      del_from_pfds (pfds, i, &fd_count);
-
-		    }
-		  else
-		    {
-                      char delimiter[]={"\n"};
-		      char *token = NULL;
-		      int rbyte;
-		      int wbyte = write (fd_log, buf, nbytes);
-		      if (wbyte == -1)
-			{
-			  perror ("write");
-			}
-		      else if (wbyte != nbytes)
-			{
-			  printf
-			    ("pollserver: write less the requested maybe try again\n");
-			}
-
-		      token = strstr(buf, delimiter);
-		      printf ("%s token\n",
-			      (token == NULL) ? ("Not found") : ("Found"));
-		      if (token != NULL)
-			{
-                          count = 0;
-			  completePacket++;
-			  if (lseek (fd_log, 0, SEEK_SET) == -1)
-			    {
-			      perror ("lseek");
-			    }
-			  rbyte = read (fd_log, buf, sizeof buf);
-			  while (rbyte > 0 && count < completePacket)
-			    {
-			      if (send (pfds[i].fd, buf, rbyte, 0) == -1)
-				{
-				  perror ("send");
-				}
-			      rbyte = read (fd_log, buf, sizeof buf);
-			      count++;
-			    }
-
-			  if (lseek (fd_log, 0, SEEK_END) == -1)
-			    {
-			      perror ("lseek");
-			    }
-			}
-		    }
-		}		// END handle data from client
-	    }			// END got ready-to-read from poll()
-	}			// END looping through file descriptors
-    }				// END for(;;)--and you thought it would never end!
-
-  printf ("pollserver: cleanup...\n");
-  closelog ();
-  for (int i = 0; i < fd_count; i++)
-    {
-      if (pfds[i].fd != listener)
-	close (pfds[i].fd);
-    }
-  close (listener);
-  close (fd_log);
-  free (pfds);
-  return 0;
+    syslog(LOG_DEBUG,"Server clean mutex.\n");
+    // Destroy mutex
+    pthread_mutex_destroy(&server_state.mutex);
+    syslog(LOG_DEBUG,"Server close log.\n");
+    closelog();
+    printf("Server shut down gracefully.\n");
+    return 0;
 }
