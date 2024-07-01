@@ -1,12 +1,12 @@
-CROSS_CC=$(CROSS_COMPILE)
-CC=$(CROSS_CC)gcc
-CFLAGS=-g -Wall
+CROSS_CC?=$(CROSS_COMPILE)
+CC?=$(CROSS_CC)gcc
+CFLAGS?=-g -Wall -Werror -Wextra
 OBJECTS=aesdsocket.o aesdsocketpthreadutils.o aesdsocketpthreadclient.o
 HEADERS=aesdsocketTypes.h
-LIBS=-lpthread
+LDFLAGS?=-lpthread
 all: aesdsocket aesdsocket.o aesdsocket.c aesdsocketpthreadclient.c aesdsocketpthreadutils.c aesdsocketTypes.h
 aesdsocket: $(OBJECTS)
-	$(CC) $(OBJECTS) $(LIBS) -o $@ 
+	$(CC) $(OBJECTS) $(LDFLAGS) -o $@ 
 aesdsocketpthreadutils.o: aesdsocketpthreadutils.c $(HEADERS)
 	$(CC) $(CFLAGS) -c $< -o $@
 aesdsocketpthreadclient.o: aesdsocketpthreadclient.c $(HEADERS)

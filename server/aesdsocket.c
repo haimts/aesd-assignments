@@ -12,6 +12,7 @@
 #include <signal.h>
 #include <netdb.h>
 #include <errno.h>
+#include <assert.h>
 #include <sys/queue.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -136,8 +137,8 @@ int setup_server() {
         close(1);       //stdout
         close(2);       //stderr
         open("/dev/null", O_RDWR);
-        dup(0);         //stdout
-        dup(0);         //stderr
+        assert(-1!=dup(0)); //stdout
+        assert(-1!=dup(0)); //stderr
         // Create a SID for child
     }
     return server_state.server_fd;

@@ -28,14 +28,22 @@ extern server_state_t server_state;
 
 void handle_signal(int signal, siginfo_t *info, void *context)
 {
-    printf("Received signal %d, shutting down...\n", signal);
+    if (context)
+    {
+        
+    }
+    printf("Received signal %d, code %d, shutting down...\n", signal, info->si_code);
     server_state.stop_server = 1;
 }
 
 void handle_sigusr1(int signal, siginfo_t *info, void *context)
 {
     static unsigned int thrashhold = 1;
-    printf("Received signal %d, cleaning up dead threads...\n", signal);
+    if (context)
+    {
+        
+    }
+    printf("Received signal %d, code %d, cleaning up dead threads...\n", signal, info->si_code);
     if (thrashhold >= D_CLEANUP_CLIENTTRASHHOLD) {
         server_state.is_cleanup_needed = 1;
     }
@@ -170,7 +178,7 @@ void*
 thread_timer(void *args)
 {
     char argv[] =
-        { "%Y%M%2d%H%M%S" };
+        { "%Y%m%2d%T" };
     server_state_t *server_common_variables_p = ((thread_node_t*) args)->server;
     int fd_log = ((thread_node_t*) args)->server->logger_fd;
     //free(args);
@@ -180,6 +188,7 @@ thread_timer(void *args)
         const int outstrlen = strlen(outstr);
         time_t t;
         struct tm *tmp;
+        int rc;
 
         if (0 != sleep(10))
             break;
@@ -198,8 +207,11 @@ thread_timer(void *args)
         pthread_mutex_lock(&server_common_variables_p->mutex);
         outstr[strlen(outstr + 1)] = '\0';
         outstr[strlen(outstr)] = '\n';
-        write(fd_log, outstr, strlen(outstr));
+        rc = write(fd_log, outstr, strlen(outstr));
         pthread_mutex_unlock(&server_common_variables_p->mutex);
+        if (rc <= 0){
+            break;
+        }
     }
 
 
